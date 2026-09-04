@@ -8,10 +8,19 @@
 # - Merges parts with pdfunite
 #
 # Usage:
-#   ./scripts/export-confluence-pdf.sh
-#   ./scripts/export-confluence-pdf.sh --page-id 8533089
-#   ./scripts/export-confluence-pdf.sh --url 'https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533089/German'
-#   ./scripts/export-confluence-pdf.sh --out /tmp/german-contracts.pdf
+#   ./export-confluence-pdf.sh
+#   ./export-confluence-pdf.sh --page-id 8533089
+#   ./export-confluence-pdf.sh --url 'https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533089/German'
+#   ./export-confluence-pdf.sh --out /tmp/german-contracts.pdf
+#
+# Replace one page's content but keep that page's original children:
+#   ./export-confluence-pdf.sh --leistungsschein 987654321
+#   ./export-confluence-pdf.sh --replace leistungsschein=987654321
+#   ./export-confluence-pdf.sh --replace avv='https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/111/AVV-Kunde'
+#
+# --replace SLOT=PAGE can be repeated. SLOT is a page id, page title, or alias
+# (leistungsschein, agb, eula, hbv, pt, abnahme, avv, tom). PAGE is a page id
+# or Confluence URL. Child pages stay on the original tree page.
 #
 # Optional auth for non-public spaces:
 #   export CONFLUENCE_EMAIL=you@example.com
@@ -24,27 +33,48 @@ PAGE_ID="8533089"
 OUT_FILE=""
 KEEP_PARTS=0
 CHROME_BIN=""
+declare -A PAGE_REPLACEMENTS=()
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
+}
+
+parse_page_ref() {
+  local ref="${1:?}"
+  if [[ "${ref}" =~ /pages/([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "${ref}" =~ ^[0-9]+$ ]]; then
+    echo "${ref}"
+  else
+    echo "Could not parse page id from: ${ref}" >&2
+    exit 1
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --page-id) PAGE_ID="${2:?}"; shift 2 ;;
     --url)
-      if [[ "$2" =~ /pages/([0-9]+) ]]; then
-        PAGE_ID="${BASH_REMATCH[1]}"
-      else
-        echo "Could not parse page id from URL: $2" >&2
-        exit 1
-      fi
+      PAGE_ID="$(parse_page_ref "${2:?}")"
       shift 2
       ;;
     --base-url) BASE_URL="${2:?}"; shift 2 ;;
     --out) OUT_FILE="${2:?}"; shift 2 ;;
     --keep-parts) KEEP_PARTS=1; shift ;;
+    --leistungsschein)
+      PAGE_REPLACEMENTS[leistungsschein]="$(parse_page_ref "${2:?}")"
+      shift 2
+      ;;
+    --replace)
+      spec="${2:?}"
+      if [[ "${spec}" != *=* ]]; then
+        echo "--replace expects SLOT=PAGE (page id or URL), got: ${spec}" >&2
+        exit 1
+      fi
+      PAGE_REPLACEMENTS["${spec%%=*}"]="$(parse_page_ref "${spec#*=}")"
+      shift 2
+      ;;
     -h|--help) usage 0 ;;
     *) echo "Unknown option: $1" >&2; usage 1 ;;
   esac
@@ -107,9 +137,23 @@ PARTS_DIR="${WORKDIR}/parts"
 mkdir -p "${PARTS_DIR}"
 trap 'rm -rf "${WORKDIR}"' EXIT
 
+REPLACEMENTS_FILE="${WORKDIR}/replacements.txt"
+: > "${REPLACEMENTS_FILE}"
+if ((${#PAGE_REPLACEMENTS[@]})); then
+  for slot in "${!PAGE_REPLACEMENTS[@]}"; do
+    printf '%s\t%s\n' "${slot}" "${PAGE_REPLACEMENTS[${slot}]}" >> "${REPLACEMENTS_FILE}"
+  done
+fi
+
 echo "Working directory: ${WORKDIR}"
 echo "Root page id: ${PAGE_ID}"
 echo "Base URL: ${BASE_URL}"
+if ((${#PAGE_REPLACEMENTS[@]})); then
+  echo "Page replacements (content only; children stay on the original page):"
+  while IFS=$'\t' read -r slot repl; do
+    echo "  ${slot} → ${repl}"
+  done < "${REPLACEMENTS_FILE}"
+fi
 
 # Collect page ids depth-first (sidebar / childPosition order).
 PAGE_IDS_FILE="${WORKDIR}/page_ids.txt"
@@ -150,14 +194,71 @@ collect_tree "${PAGE_ID}"
 mapfile -t PAGE_IDS < "${PAGE_IDS_FILE}"
 echo "Found ${#PAGE_IDS[@]} page(s)"
 
+resolve_export_page_id() {
+  local tree_page_id="$1"
+  local meta_json_file="$2"
+  python3 - "${REPLACEMENTS_FILE}" "${meta_json_file}" "${tree_page_id}" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+repl_path, meta_path, tree_page_id = sys.argv[1], sys.argv[2], sys.argv[3]
+replacements = []
+text = Path(repl_path).read_text(encoding="utf-8")
+for line in text.splitlines():
+    if not line.strip():
+        continue
+    slot, repl = line.split("\t", 1)
+    replacements.append((slot.strip(), repl.strip()))
+if not replacements:
+    print(tree_page_id)
+    raise SystemExit(0)
+
+data = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+title = data.get("title") or ""
+
+def normalize(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", s.casefold())
+
+title_n = normalize(title)
+prefix_aliases = {"leistungsschein", "abnahme", "eula", "tom"}
+
+for slot, repl in replacements:
+    if slot == tree_page_id:
+        print(repl)
+        raise SystemExit(0)
+
+for slot, repl in replacements:
+    slot_n = normalize(slot)
+    if not slot_n:
+        continue
+    if slot_n == title_n or (slot_n in prefix_aliases and title_n.startswith(slot_n)):
+        print(repl)
+        raise SystemExit(0)
+
+print(tree_page_id)
+PY
+}
+
 export_page_pdf() {
+  local tree_page_id="$1"
   local page_id="$1"
   local index="$2"
-  local meta_json_file out_pdf
+  local meta_json_file out_pdf resolved
 
-  meta_json_file="${WORKDIR}/meta.${page_id}.json"
-  api_get "/rest/api/content/${page_id}?expand=body.storage,body.view,children.attachment" \
+  meta_json_file="${WORKDIR}/meta.${tree_page_id}.json"
+  api_get "/rest/api/content/${tree_page_id}?expand=body.storage,body.view,children.attachment" \
     > "${meta_json_file}"
+
+  resolved="$(resolve_export_page_id "${tree_page_id}" "${meta_json_file}")"
+  if [[ "${resolved}" != "${tree_page_id}" ]]; then
+    echo "  replace page ${tree_page_id} → ${resolved} (children stay on ${tree_page_id})"
+    page_id="${resolved}"
+    meta_json_file="${WORKDIR}/meta.${page_id}.json"
+    api_get "/rest/api/content/${page_id}?expand=body.storage,body.view,children.attachment" \
+      > "${meta_json_file}"
+  fi
 
   python3 - "${meta_json_file}" "${WORKDIR}" "${page_id}" <<'PY' > "${WORKDIR}/decision.${page_id}.env"
 import json, re, sys
