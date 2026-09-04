@@ -22,6 +22,13 @@
 # (leistungsschein, agb, eula, hbv, pt, abnahme, avv, tom). PAGE is a page id
 # or Confluence URL. Child pages stay on the original tree page.
 #
+# Drop/cancel tagged blocks (HTML pages only). Cancelled headings stay as a
+# light-gray stub "2.3. entfällt bei On-Prem" at the original heading size;
+# tagged plain lines are removed:
+#   ./export-confluence-pdf.sh --type cloud
+#   ./export-confluence-pdf.sh --leistungsschein 1192067073 --type on-prem
+#   ./export-confluence-pdf.sh --no-hw-support
+#
 # Optional auth for non-public spaces:
 #   export CONFLUENCE_EMAIL=you@example.com
 #   export CONFLUENCE_API_TOKEN=...
@@ -33,10 +40,12 @@ PAGE_ID="8533089"
 OUT_FILE=""
 KEEP_PARTS=0
 CHROME_BIN=""
+CONTRACT_TYPE=""
+NO_HW_SUPPORT=0
 declare -A PAGE_REPLACEMENTS=()
 
 usage() {
-  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -52,6 +61,21 @@ parse_page_ref() {
   fi
 }
 
+parse_contract_type() {
+  local raw
+  raw="$(printf '%s' "${1:?}" | tr '[:upper:]' '[:lower:]')"
+  raw="${raw//_/-}"
+  raw="${raw// /-}"
+  case "${raw}" in
+    cloud) echo cloud ;;
+    on-prem|onprem|on-premise|onpremise|on-premises|onpremises) echo on-prem ;;
+    *)
+      echo "Unknown --type '${1}'. Use cloud or on-prem." >&2
+      exit 1
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --page-id) PAGE_ID="${2:?}"; shift 2 ;;
@@ -62,6 +86,14 @@ while [[ $# -gt 0 ]]; do
     --base-url) BASE_URL="${2:?}"; shift 2 ;;
     --out) OUT_FILE="${2:?}"; shift 2 ;;
     --keep-parts) KEEP_PARTS=1; shift ;;
+    --type)
+      CONTRACT_TYPE="$(parse_contract_type "${2:?}")"
+      shift 2
+      ;;
+    --no-hw-support)
+      NO_HW_SUPPORT=1
+      shift
+      ;;
     --leistungsschein)
       PAGE_REPLACEMENTS[leistungsschein]="$(parse_page_ref "${2:?}")"
       shift 2
@@ -148,6 +180,12 @@ fi
 echo "Working directory: ${WORKDIR}"
 echo "Root page id: ${PAGE_ID}"
 echo "Base URL: ${BASE_URL}"
+if [[ -n "${CONTRACT_TYPE}" ]]; then
+  echo "Contract type: ${CONTRACT_TYPE} (dropping opposite [cloud]/[on-prem] headline sections)"
+fi
+if ((NO_HW_SUPPORT)); then
+  echo "Dropping [Hardware-Support] tagged headings and lines"
+fi
 if ((${#PAGE_REPLACEMENTS[@]})); then
   echo "Page replacements (content only; children stay on the original page):"
   while IFS=$'\t' read -r slot repl; do
@@ -260,7 +298,7 @@ export_page_pdf() {
       > "${meta_json_file}"
   fi
 
-  python3 - "${meta_json_file}" "${WORKDIR}" "${page_id}" <<'PY' > "${WORKDIR}/decision.${page_id}.env"
+  python3 - "${meta_json_file}" "${WORKDIR}" "${page_id}" "${CONTRACT_TYPE}" "${NO_HW_SUPPORT}" <<'PY' > "${WORKDIR}/decision.${page_id}.env"
 import json, re, sys
 from pathlib import Path
 from html import unescape
@@ -398,6 +436,196 @@ def restore_confluence_link_labels(view_html: str, storage_html: str) -> str:
     return "".join(out)
 
 
+CONTRACT_TAG_RE = re.compile(
+    r"(?i)\[\s*(on[\s_-]*prem(?:ise)?s?|cloud)\s*\]"
+)
+HW_TAG_RE = re.compile(r"(?i)\[\s*(hardware[\s_-]*support)\s*\]")
+ANY_TAG_RE = re.compile(
+    r"(?i)\[\s*(on[\s_-]*prem(?:ise)?s?|cloud|hardware[\s_-]*support)\s*\]"
+)
+HEADING_RE = re.compile(r"(?is)<h([1-6])\b([^>]*)>(.*?)</h\1>")
+
+
+def heading_plain_text(inner: str) -> str:
+    return unescape(re.sub(r"<[^>]+>", " ", inner))
+
+
+def classify_tags(text: str) -> set[str]:
+    tags: set[str] = set()
+    for m in ANY_TAG_RE.finditer(text):
+        token = re.sub(r"[^a-z]+", "", m.group(1).casefold())
+        if token == "cloud":
+            tags.add("cloud")
+        elif token.startswith("onprem"):
+            tags.add("on-prem")
+        elif token.startswith("hardwaresupport"):
+            tags.add("hw-support")
+    return tags
+
+
+def should_drop_tagged(text: str, keep: str, no_hw: bool) -> bool:
+    tags = classify_tags(text)
+    if no_hw and "hw-support" in tags:
+        return True
+    if keep in ("cloud", "on-prem"):
+        if "cloud" in tags and keep != "cloud":
+            return True
+        if "on-prem" in tags and keep != "on-prem":
+            return True
+    return False
+
+
+ENTFAELLT_COLOR = "#d0d0d0"
+HEADING_NUMBER_RE = re.compile(
+    r"(?is)^(\s*(?:<[^>]+>\s*)*)(\d+(?:\.\d+)*\.?)"
+)
+PLAIN_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*\.?)")
+
+
+def heading_number(inner: str) -> str:
+    numbered = HEADING_NUMBER_RE.match(inner)
+    raw = numbered.group(2) if numbered else ""
+    if not raw:
+        plain = PLAIN_NUMBER_RE.match(heading_plain_text(inner))
+        raw = plain.group(1) if plain else ""
+    if raw and not raw.endswith("."):
+        raw += "."
+    return raw
+
+
+def cancel_reason_phrase(text: str, keep: str, no_hw: bool) -> str:
+    tags = classify_tags(text)
+    if keep in ("cloud", "on-prem"):
+        if ("cloud" in tags and keep != "cloud") or ("on-prem" in tags and keep != "on-prem"):
+            return "bei On-Prem" if keep == "on-prem" else "bei Cloud"
+    if no_hw and "hw-support" in tags:
+        return ""
+    if keep == "on-prem":
+        return "bei On-Prem"
+    if keep == "cloud":
+        return "bei Cloud"
+    return ""
+
+
+def cancelled_heading_label(inner: str, keep: str, no_hw: bool) -> str:
+    number = heading_number(inner)
+    reason = cancel_reason_phrase(heading_plain_text(inner), keep, no_hw)
+    label = f"{number} entfällt" if number else "entfällt"
+    if reason:
+        label = f"{label} {reason}"
+    return label
+
+
+def restyle_cancelled_heading(level: str, attrs: str, inner: str, keep: str, no_hw: bool) -> str:
+    if re.search(r"(?i)\bclass=", attrs):
+        attrs = re.sub(
+            r"""(?i)\bclass=(["'])(.*?)\1""",
+            lambda m: f"class={m.group(1)}{m.group(2)} entfaellt{m.group(1)}",
+            attrs,
+            count=1,
+        )
+    else:
+        attrs += ' class="entfaellt"'
+    cancel_style = f"color:{ENTFAELLT_COLOR};"
+    if re.search(r"(?i)\bstyle=", attrs):
+        attrs = re.sub(
+            r"""(?i)\bstyle=(["'])(.*?)\1""",
+            lambda m: f"style={m.group(1)}{cancel_style}{m.group(2)}{m.group(1)}",
+            attrs,
+            count=1,
+        )
+    else:
+        attrs += f' style="{cancel_style}"'
+    return f"<h{level}{attrs}>{cancelled_heading_label(inner, keep, no_hw)}</h{level}>"
+
+
+def filter_contract_sections(html: str, keep: str, no_hw: bool = False) -> tuple[str, int]:
+    """Cancel tagged headings (keep title, drop body) and drop tagged plain lines."""
+    if (keep not in ("cloud", "on-prem") and not no_hw) or not html:
+        return html, 0
+
+    matches = list(HEADING_RE.finditer(html))
+    ops: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(matches):
+        m = matches[i]
+        level = int(m.group(1))
+        if should_drop_tagged(heading_plain_text(m.group(3)), keep, no_hw):
+            body_end = len(html)
+            for nxt in matches[i + 1 :]:
+                if int(nxt.group(1)) <= level:
+                    body_end = nxt.start()
+                    break
+            ops.append(
+                (
+                    m.start(),
+                    body_end,
+                    restyle_cancelled_heading(m.group(1), m.group(2), m.group(3), keep, no_hw),
+                )
+            )
+            while i + 1 < len(matches) and matches[i + 1].start() < body_end:
+                i += 1
+        i += 1
+
+    if ops:
+        parts: list[str] = []
+        cursor = 0
+        for start, end, repl in ops:
+            parts.append(html[cursor:start])
+            parts.append(repl)
+            cursor = end
+        parts.append(html[cursor:])
+        html = "".join(parts)
+
+    remaining_ids = set(
+        re.findall(r"""(?i)<h[1-6]\b[^>]*\bid=["']([^"']+)["']""", html)
+    )
+
+    def drop_stale_anchor(m: re.Match[str]) -> str:
+        hid = unescape(m.group(1))[1:]
+        if hid and hid not in remaining_ids:
+            return ""
+        return m.group(0)
+
+    if remaining_ids:
+        html = re.sub(
+            r"""(?is)<a\b(?=[^>]*\bhref=["'](#[^"']+)["'])[^>]*>.*?</a>""",
+            drop_stale_anchor,
+            html,
+        )
+
+    dropped_lines = 0
+
+    def drop_tagged_plain_block(m: re.Match) -> str:
+        nonlocal dropped_lines
+        if should_drop_tagged(heading_plain_text(m.group(3)), keep, no_hw):
+            dropped_lines += 1
+            return ""
+        return m.group(0)
+
+    # Plain paragraphs/list items: drop only that block, not following siblings.
+    html = re.sub(
+        r"(?is)<(p|li)\b([^>]*)>(.*?)</\1>",
+        drop_tagged_plain_block,
+        html,
+    )
+    for _ in range(5):
+        prev = html
+        html = re.sub(r"(?is)<li\b[^>]*>\s*</li>", "", html)
+        html = re.sub(r"(?is)<ul\b[^>]*>\s*</ul>", "", html)
+        html = re.sub(r"(?is)<ol\b[^>]*>\s*</ol>", "", html)
+        if html == prev:
+            break
+
+    if keep in ("cloud", "on-prem"):
+        html = CONTRACT_TAG_RE.sub(r"\1", html)
+    if no_hw:
+        html = HW_TAG_RE.sub(r"\1", html)
+    html = re.sub(r"[ \t]{2,}", " ", html)
+    html = re.sub(r" +(</h[1-6]>)", r"\1", html, flags=re.I)
+    return html, len(ops) + dropped_lines
+
+
 gdoc_ids = []
 for m in re.finditer(
     r"https?://docs\.google\.com/(?:document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]+)",
@@ -436,6 +664,7 @@ is_att_stub = bool(att_candidates) and (has_view_file or len(plain_wo_urls) < 80
 
 strategy = "html"
 payload = ""
+filtered_sections = 0
 if is_gdoc_stub:
     strategy = "gdoc"
     payload = gdoc_ids[0]
@@ -445,6 +674,9 @@ elif is_att_stub:
 else:
     strategy = "html"
     body = restore_confluence_link_labels(view, storage) if view else f"<pre>{plain}</pre>"
+    contract_type = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+    no_hw = (sys.argv[5].strip() if len(sys.argv) > 5 else "0") in ("1", "true", "yes")
+    body, filtered_sections = filter_contract_sections(body, contract_type, no_hw)
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <title>{title}</title>
@@ -455,6 +687,7 @@ else:
   h2 {{ font-size: 12pt; line-height: 1.25; margin: 0.55em 0 0.3em; page-break-after: avoid; break-after: avoid; }}
   h3 {{ font-size: 10.5pt; line-height: 1.25; margin: 0.5em 0 0.25em; page-break-after: avoid; break-after: avoid; }}
   h4,h5,h6 {{ font-size: 9.5pt; line-height: 1.25; margin: 0.45em 0 0.2em; page-break-after: avoid; break-after: avoid; }}
+  h1.entfaellt, h2.entfaellt, h3.entfaellt, h4.entfaellt, h5.entfaellt, h6.entfaellt {{ color: #d0d0d0; }}
   h1 + *, h2 + *, h3 + *, h4 + *, h5 + *, h6 + * {{ page-break-before: avoid; break-before: avoid; }}
   p {{ orphans: 3; widows: 3; margin: 0.35em 0; }}
   ul, ol {{ margin: 0.35em 0 0.35em 1.2em; padding: 0; }}
@@ -490,6 +723,7 @@ def sh_quote(s: str) -> str:
 print(f"TITLE={sh_quote(title)}")
 print(f"STRATEGY={sh_quote(strategy)}")
 print(f"PAYLOAD={sh_quote(payload)}")
+print(f"FILTERED_SECTIONS={filtered_sections}")
 PY
 
   # shellcheck disable=SC1090
@@ -499,6 +733,9 @@ PY
   out_pdf="${PARTS_DIR}/${slug}.pdf"
 
   echo "[${index}] ${TITLE} (${page_id}) → ${STRATEGY}"
+  if [[ "${STRATEGY}" == "html" && "${FILTERED_SECTIONS:-0}" != 0 ]]; then
+    echo "  cancelled/dropped ${FILTERED_SECTIONS} tagged heading/line block(s)"
+  fi
 
   case "${STRATEGY}" in
     gdoc)
