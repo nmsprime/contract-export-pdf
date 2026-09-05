@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./export-confluence-pdf.sh
+#   ./export-confluence-pdf.sh --lang en
 #   ./export-confluence-pdf.sh --page-id 8533089
 #   ./export-confluence-pdf.sh --url 'https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533089/German'
 #   ./export-confluence-pdf.sh --out /tmp/german-contracts.pdf
@@ -18,15 +19,17 @@
 #   ./export-confluence-pdf.sh --replace leistungsschein=987654321
 #   ./export-confluence-pdf.sh --replace avv='https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/111/AVV-Kunde'
 #
+# --lang de|en selects the German (default) or English contract tree.
 # --replace SLOT=PAGE can be repeated. SLOT is a page id, page title, or alias
-# (leistungsschein, agb, eula, hbv, pt, abnahme, avv, tom). PAGE is a page id
-# or Confluence URL. Child pages stay on the original tree page.
+# (leistungsschein/service-agreement, agb/gtc, eula, hbv/all, pt, abnahme, avv/dpa,
+# tom). PAGE is a page id or Confluence URL. Child pages stay on the original tree.
 #
 # Drop/cancel tagged blocks (HTML pages only). Cancelled headings stay as a
 # light-gray stub "2.3. entfällt bei On-Prem" at the original heading size;
 # tagged plain lines are removed:
 #   ./export-confluence-pdf.sh --type cloud
 #   ./export-confluence-pdf.sh --leistungsschein 1192067073 --type on-prem
+#   ./export-confluence-pdf.sh --lang en --type cloud
 #   ./export-confluence-pdf.sh --no-hw-support
 #
 # Optional auth for non-public spaces:
@@ -36,16 +39,20 @@
 set -euo pipefail
 
 BASE_URL="${CONFLUENCE_BASE_URL:-https://nmsprime.atlassian.net/wiki}"
-PAGE_ID="8533089"
+ROOT_PAGE_DE="8533089"
+ROOT_PAGE_EN="8533093"
+PAGE_ID="${ROOT_PAGE_DE}"
+EXPLICIT_PAGE=0
 OUT_FILE=""
 KEEP_PARTS=0
 CHROME_BIN=""
 CONTRACT_TYPE=""
+CONTRACT_LANG="de"
 NO_HW_SUPPORT=0
 declare -A PAGE_REPLACEMENTS=()
 
 usage() {
-  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -76,11 +83,33 @@ parse_contract_type() {
   esac
 }
 
+parse_contract_lang() {
+  local raw
+  raw="$(printf '%s' "${1:?}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    de|german|deutsch) echo de ;;
+    en|english|englisch) echo en ;;
+    *)
+      echo "Unknown --lang '${1}'. Use de or en." >&2
+      exit 1
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --page-id) PAGE_ID="${2:?}"; shift 2 ;;
+    --page-id)
+      PAGE_ID="${2:?}"
+      EXPLICIT_PAGE=1
+      shift 2
+      ;;
     --url)
       PAGE_ID="$(parse_page_ref "${2:?}")"
+      EXPLICIT_PAGE=1
+      shift 2
+      ;;
+    --lang)
+      CONTRACT_LANG="$(parse_contract_lang "${2:?}")"
       shift 2
       ;;
     --base-url) BASE_URL="${2:?}"; shift 2 ;;
@@ -111,6 +140,14 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage 1 ;;
   esac
 done
+
+if (( ! EXPLICIT_PAGE )); then
+  if [[ "${CONTRACT_LANG}" == en ]]; then
+    PAGE_ID="${ROOT_PAGE_EN}"
+  else
+    PAGE_ID="${ROOT_PAGE_DE}"
+  fi
+fi
 
 for cmd in curl python3 pdfunite; do
   command -v "$cmd" >/dev/null || { echo "Missing dependency: $cmd" >&2; exit 1; }
@@ -179,6 +216,7 @@ fi
 
 echo "Working directory: ${WORKDIR}"
 echo "Root page id: ${PAGE_ID}"
+echo "Language: ${CONTRACT_LANG}"
 echo "Base URL: ${BASE_URL}"
 if [[ -n "${CONTRACT_TYPE}" ]]; then
   echo "Contract type: ${CONTRACT_TYPE} (dropping opposite [cloud]/[on-prem] headline sections)"
@@ -260,7 +298,26 @@ def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.casefold())
 
 title_n = normalize(title)
-prefix_aliases = {"leistungsschein", "abnahme", "eula", "tom"}
+alias_groups = {
+    "leistungsschein": ("leistungsschein", "serviceagreement", "service"),
+    "agb": ("agb", "gtc"),
+    "avv": ("avv", "dpa"),
+    "hbv": ("hbv", "all"),
+    "pt": ("pt", "paymentterms"),
+    "eula": ("eula",),
+    "abnahme": ("abnahme", "acceptance"),
+    "tom": ("tom",),
+}
+
+def slot_matches_title(slot_n: str, title_n: str) -> bool:
+    if slot_n == title_n:
+        return True
+    synonyms = (slot_n,)
+    for key, group in alias_groups.items():
+        if slot_n == key or slot_n in group:
+            synonyms = group
+            break
+    return any(title_n == syn or title_n.startswith(syn) for syn in synonyms)
 
 for slot, repl in replacements:
     if slot == tree_page_id:
@@ -271,7 +328,7 @@ for slot, repl in replacements:
     slot_n = normalize(slot)
     if not slot_n:
         continue
-    if slot_n == title_n or (slot_n in prefix_aliases and title_n.startswith(slot_n)):
+    if slot_matches_title(slot_n, title_n):
         print(repl)
         raise SystemExit(0)
 
@@ -298,7 +355,7 @@ export_page_pdf() {
       > "${meta_json_file}"
   fi
 
-  python3 - "${meta_json_file}" "${WORKDIR}" "${page_id}" "${CONTRACT_TYPE}" "${NO_HW_SUPPORT}" <<'PY' > "${WORKDIR}/decision.${page_id}.env"
+  python3 - "${meta_json_file}" "${WORKDIR}" "${page_id}" "${CONTRACT_TYPE}" "${NO_HW_SUPPORT}" "${CONTRACT_LANG}" <<'PY' > "${WORKDIR}/decision.${page_id}.env"
 import json, re, sys
 from pathlib import Path
 from html import unescape
@@ -493,30 +550,33 @@ def heading_number(inner: str) -> str:
     return raw
 
 
-def cancel_reason_phrase(text: str, keep: str, no_hw: bool) -> str:
+def cancel_reason_phrase(text: str, keep: str, no_hw: bool, lang: str) -> str:
     tags = classify_tags(text)
     if keep in ("cloud", "on-prem"):
         if ("cloud" in tags and keep != "cloud") or ("on-prem" in tags and keep != "on-prem"):
+            if lang == "en":
+                return "for On-Prem" if keep == "on-prem" else "for Cloud"
             return "bei On-Prem" if keep == "on-prem" else "bei Cloud"
     if no_hw and "hw-support" in tags:
         return ""
     if keep == "on-prem":
-        return "bei On-Prem"
+        return "for On-Prem" if lang == "en" else "bei On-Prem"
     if keep == "cloud":
-        return "bei Cloud"
+        return "for Cloud" if lang == "en" else "bei Cloud"
     return ""
 
 
-def cancelled_heading_label(inner: str, keep: str, no_hw: bool) -> str:
+def cancelled_heading_label(inner: str, keep: str, no_hw: bool, lang: str) -> str:
     number = heading_number(inner)
-    reason = cancel_reason_phrase(heading_plain_text(inner), keep, no_hw)
-    label = f"{number} entfällt" if number else "entfällt"
+    reason = cancel_reason_phrase(heading_plain_text(inner), keep, no_hw, lang)
+    verb = "omitted" if lang == "en" else "entfällt"
+    label = f"{number} {verb}" if number else verb
     if reason:
         label = f"{label} {reason}"
     return label
 
 
-def restyle_cancelled_heading(level: str, attrs: str, inner: str, keep: str, no_hw: bool) -> str:
+def restyle_cancelled_heading(level: str, attrs: str, inner: str, keep: str, no_hw: bool, lang: str) -> str:
     if re.search(r"(?i)\bclass=", attrs):
         attrs = re.sub(
             r"""(?i)\bclass=(["'])(.*?)\1""",
@@ -536,10 +596,10 @@ def restyle_cancelled_heading(level: str, attrs: str, inner: str, keep: str, no_
         )
     else:
         attrs += f' style="{cancel_style}"'
-    return f"<h{level}{attrs}>{cancelled_heading_label(inner, keep, no_hw)}</h{level}>"
+    return f"<h{level}{attrs}>{cancelled_heading_label(inner, keep, no_hw, lang)}</h{level}>"
 
 
-def filter_contract_sections(html: str, keep: str, no_hw: bool = False) -> tuple[str, int]:
+def filter_contract_sections(html: str, keep: str, no_hw: bool = False, lang: str = "de") -> tuple[str, int]:
     """Cancel tagged headings (keep title, drop body) and drop tagged plain lines."""
     if (keep not in ("cloud", "on-prem") and not no_hw) or not html:
         return html, 0
@@ -560,7 +620,7 @@ def filter_contract_sections(html: str, keep: str, no_hw: bool = False) -> tuple
                 (
                     m.start(),
                     body_end,
-                    restyle_cancelled_heading(m.group(1), m.group(2), m.group(3), keep, no_hw),
+                    restyle_cancelled_heading(m.group(1), m.group(2), m.group(3), keep, no_hw, lang),
                 )
             )
             while i + 1 < len(matches) and matches[i + 1].start() < body_end:
@@ -676,7 +736,8 @@ else:
     body = restore_confluence_link_labels(view, storage) if view else f"<pre>{plain}</pre>"
     contract_type = sys.argv[4].strip() if len(sys.argv) > 4 else ""
     no_hw = (sys.argv[5].strip() if len(sys.argv) > 5 else "0") in ("1", "true", "yes")
-    body, filtered_sections = filter_contract_sections(body, contract_type, no_hw)
+    contract_lang = sys.argv[6].strip() if len(sys.argv) > 6 else "de"
+    body, filtered_sections = filter_contract_sections(body, contract_type, no_hw, contract_lang)
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <title>{title}</title>

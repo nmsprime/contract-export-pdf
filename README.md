@@ -1,6 +1,6 @@
 # contract-export-pdf
 
-Export the NMS Prime Confluence contract tree (German space) to one merged PDF.
+Export the NMS Prime Confluence contract tree to one merged PDF. German is the default; English uses the same options on a parallel page tree.
 
 The script walks the root page and all descendants in sidebar order. For each page it either:
 
@@ -10,7 +10,8 @@ The script walks the root page and all descendants in sidebar order. For each pa
 
 and then merges the parts with `pdfunite`.
 
-Default root: [German](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533089/German) (`8533089`).
+Default root: [German](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533089/German) (`8533089`).  
+English root: [English](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533093/English) (`8533093`), via `--lang en`.
 
 ## Dependencies
 
@@ -21,6 +22,7 @@ Default root: [German](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533
 ```bash
 ./export-confluence-pdf.sh
 ./export-confluence-pdf.sh --out ./contracts.pdf
+./export-confluence-pdf.sh --lang en --out ./contracts-en.pdf
 ```
 
 ### Customer-specific page
@@ -32,8 +34,8 @@ Swap one page’s content (for example Leistungsschein) but keep the original ch
 ./export-confluence-pdf.sh --replace avv=111 --replace hbv=222
 ```
 
-`--leistungsschein` is a shortcut for `--replace leistungsschein=…`.  
-`--replace SLOT=PAGE` can be repeated. `SLOT` is a page id, title, or alias (`leistungsschein`, `agb`, `eula`, `hbv`, `pt`, `abnahme`, `avv`, `tom`). `PAGE` is a page id or Confluence URL.
+`--leistungsschein` is a shortcut for `--replace leistungsschein=…` (English title: Service Agreement).  
+`--replace SLOT=PAGE` can be repeated. `SLOT` is a page id, title, or alias (`leistungsschein` / `service-agreement`, `agb` / `gtc`, `eula`, `hbv` / `all`, `pt`, `abnahme`, `avv` / `dpa`, `tom`). `PAGE` is a page id or Confluence URL.
 
 ### Cloud / On-Prem / Hardware-Support
 
@@ -45,8 +47,8 @@ In Confluence, tag **headings** or **single lines** with `[Cloud]`, `[On-Prem]`,
 ./export-confluence-pdf.sh --leistungsschein 1192067073 --type cloud --out ./stadtwerker.pdf
 ```
 
-- `--type cloud` or `--type on-prem` — drop the other variant’s **plain lines**. Cancelled **headings** stay as a light-gray stub, e.g. `2.3. entfällt bei Cloud`, so numbering remains.
-- `--no-hw-support` — same for `[Hardware-Support]`; cancelled headings become `3.1. entfällt`.
+- `--type cloud` or `--type on-prem` — drop the other variant’s **plain lines**. Cancelled **headings** stay as a light-gray stub so numbering remains (`2.3. entfällt bei Cloud`, or `2.3. omitted for Cloud` with `--lang en`).
+- `--no-hw-support` — same for `[Hardware-Support]`; cancelled headings become `3.1. entfällt` / `3.1. omitted`.
 - Kept tags are unwrapped: `[Cloud]-Usage` → `Cloud-Usage`.
 
 HTML pages only (Leistungsschein, etc.). Google-Doc pages (AGB, AVV) are not filtered.
@@ -57,7 +59,8 @@ Without `--type` / `--no-hw-support`, all sections stay and tags stay visible.
 
 | Option | Meaning |
 |---|---|
-| `--page-id ID` | Start at this page instead of `8533089` |
+| `--lang de\|en` | German (default) or English contract tree |
+| `--page-id ID` | Start at this page (overrides `--lang` root) |
 | `--url URL` | Same, parsed from a Confluence URL |
 | `--base-url URL` | Wiki base (default `https://nmsprime.atlassian.net/wiki`) |
 | `--out FILE` | Output PDF (default: `./<root-title>_merged.pdf`) |
