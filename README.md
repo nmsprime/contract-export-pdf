@@ -22,8 +22,28 @@ English root: [English](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/853
 ```bash
 ./export-confluence-pdf.sh
 ./export-confluence-pdf.sh --out ./contracts.pdf
-./export-confluence-pdf.sh --lang en --out ./contracts-en.pdf
 ```
+
+### English contracts
+
+Same options, different root: [English](https://nmsprime.atlassian.net/wiki/spaces/NMS/pages/8533093/English) (`8533093`).
+
+```bash
+./export-confluence-pdf.sh --lang en --out ./contracts-en.pdf
+./export-confluence-pdf.sh --lang en --type cloud --no-hw-support
+./export-confluence-pdf.sh --lang en --leistungsschein 1192067073 --out ./customer-en.pdf
+```
+
+| German page | English page | `--replace` alias |
+|---|---|---|
+| Leistungsschein | Service Agreement | `leistungsschein` / `service-agreement` |
+| AGB | GTC | `agb` / `gtc` |
+| EULA german | EULA | `eula` |
+| HBV | ALL | `hbv` / `all` |
+| AVV | DPA | `avv` / `dpa` |
+| PT | PT – Payment Terms | `pt` |
+
+Cancelled heading stubs are English too (`2.3. omitted for Cloud`, `3.1. omitted`). `--page-id` / `--url` override this root if you need a subtree.
 
 ### Customer-specific page
 
